@@ -1,98 +1,64 @@
 use ::std::io::{self, Write};
-use std::net::{IpAddr, TcpStream};
-use std::str::FromStr;
-use std::sync::mpsc::{Sender, channel};
-use std::thread;
-use std::{env, process};
+use bpaf::Bpaf;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::mpsc::{channel, Sender};
+use tokio::net::TcpStream;
+use tokio::task;
 
 const MAX: u16 = 65535;
-struct Arguments {
-    flag: String,
-    ip_addr: IpAddr,
-    threads: u16,
+
+const IPFALLBACK: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+#[derive(Debug, Clone, Bpaf)]
+#[bpaf(options)]
+
+pub struct Arguments {
+    #[bpaf(long, short, fallback(IPFALLBACK))]
+    pub address: IpAddr,
+    #[bpaf(
+        long("start"),
+        short('s'),
+        fallback(1u16),
+        guard(start_port_guard, "start port must be greater than 0")
+    )]
+    pub start_port: u16,
+    #[bpaf(
+        long("end"),
+        short('e'),
+        fallback(MAX),
+        guard(end_port_guard, "end port must be less than or equalt to 65535")
+    )]
+    pub end_port: u16,
 }
 
-impl Arguments {
-    fn new(Arguments: &[String]) -> Result<Arguments, &'static str> {
-        if Arguments.len() < 2 {
-            return Err("Not enough arguments");
-        } else if Arguments.len() > 4 {
-            return Err("Too many arguments");
+fn start_port_guard(input: &u16) -> bool {
+    *input > 0
+}
+
+fn end_port_guard(input: &u16) -> bool {
+    *input <= MAX
+}
+
+async fn scan(tx: Sender<u16>, port: u16, addr: IpAddr) {
+    match TcpStream::connect(format!("{}:{}", addr, port)).await {
+        Ok(_) => {
+            print!(".");
+            io::stdout().flush().unwrap();
+            tx.send(port).unwrap();
         }
-        let f = Arguments[1].clone();
-        if let Ok(ip_addr) = IpAddr::from_str(&f) {
-            return Ok(Arguments {
-                flag: String::from(""),
-                ip_addr,
-                threads: 4,
-            });
-        } else {
-            let flag = Arguments[1].clone();
-            if flag.contains("-h") || flag.contains("-help") && Arguments.len() == 2 {
-                println!(
-                    "Usage: -j to select how many threads to use \n\r -h or -help to display this message"
-                );
-                return Err("help");
-            } else if flag.contains("-h") || flag.contains("-help") {
-                return Err("too many arguments");
-            } else if flag.contains("-j") {
-                let ipaddr = match IpAddr::from_str(&Arguments[3]) {
-                    Ok(s) => s,
-                    Err(_) => return Err("invalid IP, must be in IPv4 format or ipv6 format"),
-                };
-                let threads = match Arguments[2].parse::<u16>() {
-                    Ok(s) => s,
-                    Err(_) => return Err("invalid thread number"),
-                };
-                return Ok(Arguments {
-                    threads,
-                    flag,
-                    ip_addr: ipaddr,
-                });
-            } else {
-                return Err("Invalid syntax");
-            }
-        }
+        Err(_) => {}
     }
 }
 
-fn scan(tx: Sender<u16>, start_port: u16, addr: IpAddr, num_threads: u16) {
-    let mut port: u16 = start_port + 1;
-    loop {
-        match TcpStream::connect((addr, port)) {
-            Ok(_) => {
-                print!(".");
-                io::stdout().flush().unwrap();
-                tx.send(port).unwrap();
-            }
-            Err(_) => {}
-        }
-        if (MAX - port) <= num_threads {
-            break;
-        }
-        port += num_threads;
-    }
-}
+#[tokio::main]
+async fn main() {
+    let opts = arguments().run();
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let program = args[0].clone();
-    let arguments = Arguments::new(&args).unwrap_or_else(|err| {
-        if err.contains("help") {
-            process::exit(0);
-        } else {
-            eprintln!("{}: {}", program, err);
-            process::exit(0);
-        }
-    });
-
-    let num_threads = arguments.threads;
-    let addr = arguments.ip_addr;
     let (tx, rs) = channel();
-    for i in 0..num_threads {
+    for i in opts.start_port..opts.end_port {
         let tx = tx.clone();
-        thread::spawn(move || {
-            scan(tx, i, arguments.ip_addr, num_threads);
+        task::spawn(async move {
+            scan(tx, i, opts.address).await;
         });
     }
 
